@@ -28,12 +28,12 @@ use hmac::{Hmac, Mac};
 use js_sys::Function;
 use prost::Message;
 use sha2::{Digest, Sha256, Sha512};
+use std::collections::HashMap;
 use std::io::{self, Read};
 use wasm_bindgen::prelude::*;
 
 type HmacSha256 = Hmac<Sha256>;
 
-// Keep the original protobuf module
 pub mod signal {
     include!(concat!(env!("OUT_DIR"), "/signal.rs"));
 }
@@ -63,19 +63,22 @@ impl DecryptionResult {
     }
 }
 
-// Helper struct to read from byte slice
-struct ByteReader<'a> {
-    data: &'a [u8],
+struct ByteReader {
+    data: Vec<u8>,
     position: usize,
 }
 
-impl<'a> ByteReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
+impl ByteReader {
+    fn new(data: Vec<u8>) -> Self {
         ByteReader { data, position: 0 }
+    }
+
+    fn remaining_data(&self) -> &[u8] {
+        &self.data[self.position..]
     }
 }
 
-impl<'a> Read for ByteReader<'a> {
+impl Read for ByteReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let available = self.data.len() - self.position;
         let amount = buf.len().min(available);
@@ -90,7 +93,6 @@ impl<'a> Read for ByteReader<'a> {
     }
 }
 
-// Keep the original structs but without Debug derive
 struct HeaderData {
     initialisation_vector: Vec<u8>,
     salt: Vec<u8>,
@@ -230,211 +232,261 @@ fn decrypt_frame(
         .map_err(|e| JsValue::from_str(&format!("Failed to decode frame: {}", e)))
 }
 
-// this would be used for attachments, stickers, avatars, which we might need later
-fn decrypt_frame_payload(
-    reader: &mut ByteReader,
-    length: usize,
-    hmac_key: &[u8],
-    cipher_key: &[u8],
-    initialisation_vector: &[u8],
-    chunk_size: usize,
-) -> Result<Vec<u8>, JsValue> {
-    let mut hmac = <HmacSha256 as Mac>::new_from_slice(hmac_key)
-        .map_err(|_| JsValue::from_str("Invalid HMAC key"))?;
-    Mac::update(&mut hmac, initialisation_vector);
-
-    let mut ctr =
-        <Ctr32BE<Aes256> as KeyIvInit>::new_from_slices(cipher_key, initialisation_vector)
-            .map_err(|_| JsValue::from_str("Invalid CTR parameters"))?;
-
-    let mut decrypted_data = Vec::new();
-    let mut remaining_length = length;
-
-    while remaining_length > 0 {
-        let this_chunk_length = remaining_length.min(chunk_size);
-        remaining_length -= this_chunk_length;
-
-        let mut ciphertext = vec![0u8; this_chunk_length];
-        reader
-            .read_exact(&mut ciphertext)
-            .map_err(|e| JsValue::from_str(&format!("Failed to read chunk: {}", e)))?;
-        Mac::update(&mut hmac, &ciphertext);
-
-        let mut decrypted_chunk = ciphertext;
-        ctr.apply_keystream(&mut decrypted_chunk);
-        decrypted_data.extend(decrypted_chunk);
-    }
-
-    let mut their_mac = [0u8; 10];
-    reader
-        .read_exact(&mut their_mac)
-        .map_err(|e| JsValue::from_str(&format!("Failed to read MAC: {}", e)))?;
-    let our_mac = hmac.finalize().into_bytes();
-
-    if &their_mac != &our_mac[..10] {
-        return Err(JsValue::from_str(
-            "Bad MAC found. Passphrase may be incorrect or file corrupted or incompatible.",
-        ));
-    }
-
-    Ok(decrypted_data)
+#[wasm_bindgen]
+pub struct BackupDecryptor {
+    reader: ByteReader,
+    keys: Option<Keys>,
+    header_data: Option<HeaderData>,
+    initialisation_vector: Option<Vec<u8>>,
+    database_bytes: Vec<u8>,
+    preferences: HashMap<String, HashMap<String, HashMap<String, serde_json::Value>>>,
+    key_values: HashMap<String, HashMap<String, serde_json::Value>>,
+    ciphertext_buf: Vec<u8>,
+    plaintext_buf: Vec<u8>,
+    total_bytes_processed: usize,
+    is_initialized: bool,
 }
 
 #[wasm_bindgen]
-pub fn decrypt_backup(
-    backup_data: &[u8],
-    passphrase: &str,
-    progress_callback: &Function,
-) -> Result<DecryptionResult, JsValue> {
-    let mut reader = ByteReader::new(backup_data);
-    let total_size = backup_data.len();
-    let mut last_percentage = 0;
-
-    // Set up collections for results
-    let mut database_bytes = Vec::new();
-    let mut preferences: std::collections::HashMap<
-        String,
-        std::collections::HashMap<String, std::collections::HashMap<String, serde_json::Value>>,
-    > = std::collections::HashMap::new();
-    let mut key_values: std::collections::HashMap<
-        String,
-        std::collections::HashMap<String, serde_json::Value>,
-    > = std::collections::HashMap::new();
-
-    // Read header and derive keys
-    let header_data = read_backup_header(&mut reader)?;
-    let keys = derive_keys(passphrase, &header_data.salt)?;
-    let mut initialisation_vector = header_data.initialisation_vector.clone();
-
-    // Pre-allocate buffers for frame decryption
-    let mut ciphertext: Vec<u8> = Vec::with_capacity(1024 * 1024);
-    let mut plaintext: Vec<u8> = Vec::with_capacity(1024 * 1024);
-
-    // Main decryption loop
-    loop {
-        // Update progress
-        let current_position = reader.position;
-        let percentage = ((current_position as f64 / total_size as f64) * 100.0) as u32;
-        if percentage != last_percentage {
-            progress_callback
-                .call1(&JsValue::NULL, &JsValue::from_f64(percentage as f64))
-                .map_err(|e| JsValue::from_str(&format!("Failed to report progress: {:?}", e)))?;
-            last_percentage = percentage;
+impl BackupDecryptor {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        Self {
+            reader: ByteReader::new(Vec::new()),
+            keys: None,
+            header_data: None,
+            initialisation_vector: None,
+            database_bytes: Vec::new(),
+            preferences: HashMap::new(),
+            key_values: HashMap::new(),
+            ciphertext_buf: Vec::with_capacity(1024 * 1024),
+            plaintext_buf: Vec::with_capacity(1024 * 1024),
+            total_bytes_processed: 0,
+            is_initialized: false,
         }
-
-        let backup_frame = decrypt_frame(
-            &mut reader,
-            &keys.hmac_key,
-            &keys.cipher_key,
-            &initialisation_vector,
-            header_data.version,
-            &mut ciphertext,
-            &mut plaintext,
-        )?;
-
-        initialisation_vector = increment_initialisation_vector(&initialisation_vector);
-
-        if backup_frame.end.unwrap_or(false) {
-            break;
-        } else if let Some(statement) = backup_frame.statement {
-            if let Some(sql) = statement.statement {
-                if !sql.to_lowercase().starts_with("create table sqlite_")
-                    && !sql.contains("sms_fts_")
-                    && !sql.contains("mms_fts_")
-                {
-                    // Store SQL statements and parameters for database reconstruction
-                    database_bytes.extend_from_slice(sql.as_bytes());
-                    database_bytes.push(b';');
-                }
-            }
-        } else if let Some(preference) = backup_frame.preference {
-            let value_dict = preferences
-                .entry(preference.file.unwrap_or_default())
-                .or_default()
-                .entry(preference.key.unwrap_or_default())
-                .or_default();
-
-            if let Some(value) = preference.value {
-                value_dict.insert("value".to_string(), serde_json::Value::String(value));
-            }
-            if let Some(boolean_value) = preference.boolean_value {
-                value_dict.insert(
-                    "booleanValue".to_string(),
-                    serde_json::Value::Bool(boolean_value),
-                );
-            }
-            if preference.is_string_set_value.unwrap_or(false) {
-                value_dict.insert(
-                    "stringSetValue".to_string(),
-                    serde_json::Value::Array(
-                        preference
-                            .string_set_value
-                            .into_iter()
-                            .map(serde_json::Value::String)
-                            .collect(),
-                    ),
-                );
-            }
-        } else if let Some(key_value) = backup_frame.key_value {
-            let value_dict = key_values
-                .entry(key_value.key.unwrap_or_default())
-                .or_default();
-
-            if let Some(boolean_value) = key_value.boolean_value {
-                value_dict.insert(
-                    "booleanValue".to_string(),
-                    serde_json::Value::Bool(boolean_value),
-                );
-            }
-            if let Some(float_value) = key_value.float_value {
-                value_dict.insert(
-                    "floatValue".to_string(),
-                    serde_json::Value::Number(
-                        serde_json::Number::from_f64(float_value.into()).unwrap(),
-                    ),
-                );
-            }
-            if let Some(integer_value) = key_value.integer_value {
-                value_dict.insert(
-                    "integerValue".to_string(),
-                    serde_json::Value::Number(integer_value.into()),
-                );
-            }
-            if let Some(long_value) = key_value.long_value {
-                value_dict.insert(
-                    "longValue".to_string(),
-                    serde_json::Value::Number(long_value.into()),
-                );
-            }
-            if let Some(string_value) = key_value.string_value {
-                value_dict.insert(
-                    "stringValue".to_string(),
-                    serde_json::Value::String(string_value),
-                );
-            }
-            if let Some(blob_value) = key_value.blob_value {
-                value_dict.insert(
-                    "blobValueBase64".to_string(),
-                    serde_json::Value::String(base64::Engine::encode(
-                        &base64::engine::general_purpose::STANDARD,
-                        &blob_value,
-                    )),
-                );
-            }
-        }
-        // Note: We're skipping attachments, stickers, and avatars for now
     }
 
-    // Final progress update
-    progress_callback
-        .call1(&JsValue::NULL, &JsValue::from_f64(100.0))
-        .map_err(|e| JsValue::from_str(&format!("Failed to report final progress: {:?}", e)))?;
+    #[wasm_bindgen]
+    pub fn feed_data(&mut self, chunk: &[u8]) {
+        let mut new_data = self.reader.remaining_data().to_vec();
+        new_data.extend_from_slice(chunk);
+        self.total_bytes_processed += chunk.len();
+        self.reader = ByteReader::new(new_data);
+    }
 
-    Ok(DecryptionResult {
-        database_bytes,
-        preferences: serde_json::to_string(&preferences)
-            .map_err(|e| JsValue::from_str(&format!("Failed to serialize preferences: {}", e)))?,
-        key_values: serde_json::to_string(&key_values)
-            .map_err(|e| JsValue::from_str(&format!("Failed to serialize key_values: {}", e)))?,
-    })
+    #[wasm_bindgen]
+    pub fn process_chunk(
+        &mut self,
+        passphrase: &str,
+        progress_callback: &Function,
+    ) -> Result<bool, JsValue> {
+        if !self.is_initialized {
+            // Initialize on first chunk
+            self.header_data = Some(read_backup_header(&mut self.reader)?);
+            let header_data = self.header_data.as_ref().unwrap();
+            self.keys = Some(derive_keys(passphrase, &header_data.salt)?);
+            self.initialisation_vector = Some(header_data.initialisation_vector.clone());
+            self.is_initialized = true;
+        }
+
+        // Calculate progress based on current position
+        let current_position = self.reader.position;
+        let percentage =
+            ((current_position as f64 / self.total_bytes_processed as f64) * 100.0) as u32;
+
+        // Report progress
+        progress_callback
+            .call1(&JsValue::NULL, &JsValue::from_f64(percentage as f64))
+            .map_err(|e| JsValue::from_str(&format!("Failed to report progress: {:?}", e)))?;
+
+        let keys = self.keys.as_ref().unwrap();
+        let header_data = self.header_data.as_ref().unwrap();
+        let iv = self.initialisation_vector.as_ref().unwrap();
+
+        match decrypt_frame(
+            &mut self.reader,
+            &keys.hmac_key,
+            &keys.cipher_key,
+            iv,
+            header_data.version,
+            &mut self.ciphertext_buf,
+            &mut self.plaintext_buf,
+        ) {
+            Ok(backup_frame) => {
+                self.initialisation_vector = Some(increment_initialisation_vector(iv));
+
+                if backup_frame.end.unwrap_or(false) {
+                    // Report 100% completion when done
+                    progress_callback
+                        .call1(&JsValue::NULL, &JsValue::from_f64(100.0))
+                        .map_err(|e| {
+                            JsValue::from_str(&format!("Failed to report final progress: {:?}", e))
+                        })?;
+                    return Ok(true);
+                }
+
+                // Process frame contents
+                if let Some(statement) = backup_frame.statement {
+                    if let Some(sql) = statement.statement {
+                        if !sql.to_lowercase().starts_with("create table sqlite_")
+                            && !sql.contains("sms_fts_")
+                            && !sql.contains("mms_fts_")
+                        {
+                            self.database_bytes.extend_from_slice(sql.as_bytes());
+                            self.database_bytes.push(b';');
+                        }
+                    }
+                } else if let Some(preference) = backup_frame.preference {
+                    let value_dict = self
+                        .preferences
+                        .entry(preference.file.unwrap_or_default())
+                        .or_default()
+                        .entry(preference.key.unwrap_or_default())
+                        .or_default();
+
+                    if let Some(value) = preference.value {
+                        value_dict.insert("value".to_string(), serde_json::Value::String(value));
+                    }
+                    if let Some(boolean_value) = preference.boolean_value {
+                        value_dict.insert(
+                            "booleanValue".to_string(),
+                            serde_json::Value::Bool(boolean_value),
+                        );
+                    }
+                    if preference.is_string_set_value.unwrap_or(false) {
+                        value_dict.insert(
+                            "stringSetValue".to_string(),
+                            serde_json::Value::Array(
+                                preference
+                                    .string_set_value
+                                    .into_iter()
+                                    .map(serde_json::Value::String)
+                                    .collect(),
+                            ),
+                        );
+                    }
+                } else if let Some(key_value) = backup_frame.key_value {
+                    let key = key_value.key.clone().unwrap_or_default();
+                    let value_dict = self.key_values.entry(key).or_default();
+
+                    if let Some(boolean_value) = key_value.boolean_value {
+                        value_dict.insert(
+                            "booleanValue".to_string(),
+                            serde_json::Value::Bool(boolean_value),
+                        );
+                    }
+                    if let Some(float_value) = key_value.float_value {
+                        value_dict.insert(
+                            "floatValue".to_string(),
+                            serde_json::Value::Number(
+                                serde_json::Number::from_f64(float_value.into()).unwrap(),
+                            ),
+                        );
+                    }
+                    if let Some(integer_value) = key_value.integer_value {
+                        value_dict.insert(
+                            "integerValue".to_string(),
+                            serde_json::Value::Number(integer_value.into()),
+                        );
+                    }
+                    if let Some(long_value) = key_value.long_value {
+                        value_dict.insert(
+                            "longValue".to_string(),
+                            serde_json::Value::Number(long_value.into()),
+                        );
+                    }
+                    if let Some(string_value) = key_value.string_value {
+                        value_dict.insert(
+                            "stringValue".to_string(),
+                            serde_json::Value::String(string_value),
+                        );
+                    }
+                    if let Some(blob_value) = key_value.blob_value {
+                        value_dict.insert(
+                            "blobValueBase64".to_string(),
+                            serde_json::Value::String(base64::Engine::encode(
+                                &base64::engine::general_purpose::STANDARD,
+                                &blob_value,
+                            )),
+                        );
+                    }
+                }
+
+                Ok(false)
+            }
+            Err(e) => {
+                if e.as_string()
+                    .unwrap_or_default()
+                    .contains("unexpected end of file")
+                {
+                    Ok(false)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    #[wasm_bindgen]
+    pub fn finish(self) -> Result<DecryptionResult, JsValue> {
+        Ok(DecryptionResult {
+            database_bytes: self.database_bytes,
+            preferences: serde_json::to_string(&self.preferences).map_err(|e| {
+                JsValue::from_str(&format!("Failed to serialize preferences: {}", e))
+            })?,
+            key_values: serde_json::to_string(&self.key_values).map_err(|e| {
+                JsValue::from_str(&format!("Failed to serialize key_values: {}", e))
+            })?,
+        })
+    }
 }
+
+// this would be used for attachments, stickers, avatars, which we might need later
+// fn decrypt_frame_payload(
+//     reader: &mut ByteReader,
+//     length: usize,
+//     hmac_key: &[u8],
+//     cipher_key: &[u8],
+//     initialisation_vector: &[u8],
+//     chunk_size: usize,
+// ) -> Result<Vec<u8>, JsValue> {
+//     let mut hmac = <HmacSha256 as Mac>::new_from_slice(hmac_key)
+//         .map_err(|_| JsValue::from_str("Invalid HMAC key"))?;
+//     Mac::update(&mut hmac, initialisation_vector);
+
+//     let mut ctr =
+//         <Ctr32BE<Aes256> as KeyIvInit>::new_from_slices(cipher_key, initialisation_vector)
+//             .map_err(|_| JsValue::from_str("Invalid CTR parameters"))?;
+
+//     let mut decrypted_data = Vec::new();
+//     let mut remaining_length = length;
+
+//     while remaining_length > 0 {
+//         let this_chunk_length = remaining_length.min(chunk_size);
+//         remaining_length -= this_chunk_length;
+
+//         let mut ciphertext = vec![0u8; this_chunk_length];
+//         reader
+//             .read_exact(&mut ciphertext)
+//             .map_err(|e| JsValue::from_str(&format!("Failed to read chunk: {}", e)))?;
+//         Mac::update(&mut hmac, &ciphertext);
+
+//         let mut decrypted_chunk = ciphertext;
+//         ctr.apply_keystream(&mut decrypted_chunk);
+//         decrypted_data.extend(decrypted_chunk);
+//     }
+
+//     let mut their_mac = [0u8; 10];
+//     reader
+//         .read_exact(&mut their_mac)
+//         .map_err(|e| JsValue::from_str(&format!("Failed to read MAC: {}", e)))?;
+//     let our_mac = hmac.finalize().into_bytes();
+
+//     if &their_mac != &our_mac[..10] {
+//         return Err(JsValue::from_str(
+//             "Bad MAC found. Passphrase may be incorrect or file corrupted or incompatible.",
+//         ));
+//     }
+
+//     Ok(decrypted_data)
+// }
