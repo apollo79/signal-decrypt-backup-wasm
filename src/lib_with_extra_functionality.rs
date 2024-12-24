@@ -1,4 +1,10 @@
-// helper functions for protobufs
+/**
+* This file is not in use
+* It contains functionality that was excluded in the final version, namely decryption of attachments, sticker and avatars
+* as they are not useful for the purpose of generatin stats. Moreover the decryption including attachments, stickers and avatars
+* took ~5m while without it the decryption takes ~10-15s
+*/
+
 pub(crate) mod bytes_serde {
     use prost::bytes::Bytes;
     use serde::{Deserialize, Deserializer, Serializer};
@@ -28,20 +34,30 @@ use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use prost::Message;
 use sha2::{Digest, Sha256, Sha512};
+use std::collections::HashMap;
 use std::io::{self, Read};
 use wasm_bindgen::prelude::*;
 
 extern crate console_error_panic_hook;
 
+type HmacSha256 = Hmac<Sha256>;
+
 pub mod signal {
     include!(concat!(env!("OUT_DIR"), "/signal.rs"));
 }
 
-type HmacSha256 = Hmac<Sha256>;
+// #[derive(Debug)]
+// enum AttachmentType {
+//     Attachment,
+//     Sticker,
+//     Avatar,
+// }
 
 #[wasm_bindgen]
 pub struct DecryptionResult {
     database_bytes: Vec<u8>,
+    preferences: String,
+    key_values: String,
 }
 
 #[wasm_bindgen]
@@ -49,6 +65,16 @@ impl DecryptionResult {
     #[wasm_bindgen(getter)]
     pub fn database_bytes(&self) -> Vec<u8> {
         self.database_bytes.clone()
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn preferences(&self) -> String {
+        self.preferences.clone()
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn key_values(&self) -> String {
+        self.key_values.clone()
     }
 }
 
@@ -58,8 +84,6 @@ struct ByteReader {
     position: usize,
 }
 
-// cusstom reader implementation, like `io::BufReader`
-// when data is read, it will on a subsequent read_exact call start at the point where it stopped before
 impl ByteReader {
     fn new(data: Vec<u8>) -> Self {
         ByteReader { data, position: 0 }
@@ -73,19 +97,6 @@ impl ByteReader {
         self.remaining_data().len()
     }
 
-    fn get_position(&self) -> usize {
-        self.position
-    }
-
-    fn set_position(&mut self, new_position: usize) {
-        self.position = new_position;
-    }
-
-    fn increment_position(&mut self, interval: usize) {
-        self.position += interval;
-    }
-
-    // reads data into a passed buffer
     fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
         let available = self.remaining_data();
 
@@ -127,13 +138,7 @@ struct Keys {
     hmac_key: Vec<u8>,
 }
 
-fn io_err_to_js(e: io::Error) -> JsValue {
-    JsValue::from_str(&format!("IO Error: {}", e))
-}
-
-fn sql_parameter_to_string(
-    parameter: &signal::sql_statement::SqlParameter,
-) -> Result<String, JsValue> {
+fn parameter_to_string(parameter: &signal::sql_statement::SqlParameter) -> Result<String, JsValue> {
     if let Some(s) = &parameter.string_paramter {
         Ok(format!("'{}'", s.replace("'", "''")))
     } else if let Some(i) = parameter.integer_parameter {
@@ -154,16 +159,15 @@ fn sql_parameter_to_string(
     }
 }
 
-// concatenates an sql string with placeholders with parameters
 fn process_parameter_placeholders(sql: &str, params: &[String]) -> Result<String, JsValue> {
     let mut result = sql.to_string();
     let mut param_index = 0;
 
+    // Handle different types of parameter placeholders
     while param_index < params.len() {
         let rest = &result[param_index..];
 
-        // Find the next placeholders
-        // signal backups only use the standard type and not indexed or other ones
+        // Find the next placeholder
         let next_placeholder = rest.find('?').map(|i| (i, 1)); // ? style
 
         match next_placeholder {
@@ -235,7 +239,6 @@ fn increment_initialisation_vector(initialisation_vector: &[u8]) -> Vec<u8> {
     new_iv
 }
 
-// read initial cryptographic information (initialisation_vector, salt) and backup version
 fn read_backup_header(reader: &mut ByteReader) -> Result<HeaderData, JsValue> {
     let mut length_bytes = [0u8; 4];
     reader
@@ -263,7 +266,10 @@ fn read_backup_header(reader: &mut ByteReader) -> Result<HeaderData, JsValue> {
     })
 }
 
-// read the frame length, which is encrypted in the first 4 bytes of a frame
+fn io_err_to_js(e: io::Error) -> JsValue {
+    JsValue::from_str(&format!("IO Error: {}", e))
+}
+
 fn get_frame_length(
     reader: &mut ByteReader,
     hmac: &mut HmacSha256,
@@ -276,7 +282,6 @@ fn get_frame_length(
         return Ok(None); // Not enough data to read the frame length
     }
 
-    // in the old version, the length of the frames was not encrypted
     let length = match header_version {
         None => {
             let mut length_bytes = [0u8; 4];
@@ -290,12 +295,24 @@ fn get_frame_length(
                 .read_exact(&mut encrypted_length)
                 .map_err(io_err_to_js)?;
 
+            // web_sys::console::log_1(
+            //     &format!("encrypted length bytes: {:02x?}", encrypted_length).into(),
+            // );
+
+            // web_sys::console::log_1(&"updating hmac".into());
+
             Mac::update(hmac, &encrypted_length);
 
             let mut decrypted_length = encrypted_length;
             ctr.apply_keystream(&mut decrypted_length);
 
-            u32::from_be_bytes(decrypted_length)
+            // web_sys::console::log_1(
+            //     &format!("decrypted length bytes: {:02x?}", decrypted_length).into(),
+            // );
+
+            let len = u32::from_be_bytes(decrypted_length);
+            // web_sys::console::log_1(&format!("length: {}", len).into());
+            len
         }
         Some(v) => return Err(JsValue::from_str(&format!("Unsupported version: {}", v))),
     };
@@ -303,21 +320,22 @@ fn get_frame_length(
     Ok(Some(length))
 }
 
-// decrypt the frame content
 fn decrypt_frame(
     reader: &mut ByteReader,
     mut hmac: HmacSha256,
     ctr: &mut Ctr32BE<Aes256>,
     ciphertext_buf: &mut Vec<u8>,
     plaintext_buf: &mut Vec<u8>,
-    frame_length: u32,
+    length: u32,
 ) -> Result<Option<signal::BackupFrame>, JsValue> {
-    if reader.remaining_length() < frame_length as usize {
-        return Ok(None); // Not enough data to read the frame
+    if reader.remaining_length() < length as usize {
+        // web_sys::console::log_1(&"remaining data is too less".into());
+
+        return Ok(None); // Not =enough data to read the frame
     }
 
     ciphertext_buf.clear();
-    ciphertext_buf.resize((frame_length - 10) as usize, 0);
+    ciphertext_buf.resize((length - 10) as usize, 0);
     reader.read_exact(ciphertext_buf).map_err(io_err_to_js)?;
 
     let mut their_mac = [0u8; 10];
@@ -342,7 +360,88 @@ fn decrypt_frame(
     let backup_frame = signal::BackupFrame::decode(&plaintext_buf[..])
         .map_err(|e| JsValue::from_str(&format!("Failed to decode frame: {}", e)))?;
 
+    // web_sys::console::log_1(&format!("position: {}", reader.get_position()).into());
+    // if reader.remaining_length() >= 10 {
+    //     web_sys::console::log_1(
+    //         &format!("remaining data: {:02x?}", &reader.remaining_data()[..10]).into(),
+    //     );
+    // }
+
     Ok(Some(backup_frame))
+}
+
+// this decrypts attachments, stickers and avatars in chunks
+fn decrypt_frame_payload(
+    reader: &mut ByteReader,
+    length: usize,
+    hmac_key: &[u8],
+    cipher_key: &[u8],
+    initialisation_vector: &[u8],
+    chunk_size: usize,
+) -> Result<Option<Vec<u8>>, JsValue> {
+    if reader.remaining_length() < length {
+        // web_sys::console::log_1(&"too little data to decrypt attachment".into());
+        // web_sys::console::log_1(
+        //     &format!(
+        //         "payload: too little remaining data: {:02x?}",
+        //         &reader.remaining_data()[..10]
+        //     )
+        //     .into(),
+        // );
+        return Ok(None);
+    } else {
+        // web_sys::console::log_1(
+        //     &format!(
+        //         "payload: enough remaining data: {:02x?}",
+        //         &reader.remaining_data()[..10]
+        //     )
+        //     .into(),
+        // );
+    }
+
+    let mut hmac = <HmacSha256 as Mac>::new_from_slice(hmac_key)
+        .map_err(|_| JsValue::from_str("Invalid HMAC key"))?;
+    Mac::update(&mut hmac, initialisation_vector);
+
+    let mut ctr =
+        <Ctr32BE<Aes256> as KeyIvInit>::new_from_slices(cipher_key, initialisation_vector)
+            .map_err(|_| JsValue::from_str("Invalid CTR parameters"))?;
+
+    let mut decrypted_data = Vec::new();
+    let mut remaining_length = length;
+
+    while remaining_length > 0 {
+        let this_chunk_length = remaining_length.min(chunk_size);
+        remaining_length -= this_chunk_length;
+
+        let mut ciphertext = vec![0u8; this_chunk_length];
+        reader
+            .read_exact(&mut ciphertext)
+            .map_err(|e| JsValue::from_str(&format!("Failed to read chunk: {}", e)))?;
+        Mac::update(&mut hmac, &ciphertext);
+
+        let mut decrypted_chunk = ciphertext;
+        ctr.apply_keystream(&mut decrypted_chunk);
+        decrypted_data.extend(decrypted_chunk);
+    }
+
+    let mut their_mac = [0u8; 10];
+
+    reader
+        .read_exact(&mut their_mac)
+        .map_err(|e| JsValue::from_str(&format!("Failed to read MAC: {}", e)))?;
+
+    let our_mac = hmac.finalize().into_bytes();
+
+    if &their_mac != &our_mac[..10] {
+        return Err(JsValue::from_str(&format!(
+            "payload: MAC verification failed. Their MAC: {:02x?}, Our MAC: {:02x?}",
+            their_mac,
+            &our_mac[..10]
+        )));
+    }
+
+    Ok(Some(decrypted_data))
 }
 
 #[wasm_bindgen]
@@ -352,12 +451,16 @@ pub struct BackupDecryptor {
     header_data: Option<HeaderData>,
     initialisation_vector: Option<Vec<u8>>,
     database_bytes: Vec<u8>,
+    preferences: HashMap<String, HashMap<String, HashMap<String, serde_json::Value>>>,
+    key_values: HashMap<String, HashMap<String, serde_json::Value>>,
+    // attachments: HashMap<String, Vec<u8>>,
+    // stickers: HashMap<String, Vec<u8>>,
+    // avatars: HashMap<String, Vec<u8>>,
     ciphertext_buf: Vec<u8>,
     plaintext_buf: Vec<u8>,
     total_bytes_received: usize,
     is_initialized: bool,
-    // this is stored if the frame has been decrypted but it is an attachment for which we don't have enough data available
-    // so we don't need to decrypt the whole frame again
+    current_backup_frame_length: Option<u32>,
     current_backup_frame: Option<signal::BackupFrame>,
 }
 
@@ -366,24 +469,41 @@ impl BackupDecryptor {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
         console_error_panic_hook::set_once();
-
         Self {
             reader: ByteReader::new(Vec::new()),
             keys: None,
             header_data: None,
             initialisation_vector: None,
             database_bytes: Vec::new(),
+            preferences: HashMap::new(),
+            key_values: HashMap::new(),
+            // attachments: HashMap::new(),
+            // stickers: HashMap::new(),
+            // avatars: HashMap::new(),
             ciphertext_buf: Vec::new(),
             plaintext_buf: Vec::new(),
             total_bytes_received: 0,
             is_initialized: false,
+            current_backup_frame_length: None,
             current_backup_frame: None,
         }
     }
 
-    // provide more data of the backup while keeping potentially existing data
     #[wasm_bindgen]
     pub fn feed_data(&mut self, chunk: &[u8]) {
+        // web_sys::console::log_1(
+        //     &format!("feeding: position: {}", self.reader.get_position()).into(),
+        // );
+        // if self.reader.remaining_length() >= 10 {
+        // web_sys::console::log_1(
+        //     &format!(
+        //         "feeding: remaining data: {:02x?}",
+        //         &self.reader.remaining_data()[..10]
+        //     )
+        //     .into(),
+        // );
+        // }
+
         let current_size = self.reader.remaining_data().len();
         let mut new_data = Vec::with_capacity(current_size + chunk.len());
         new_data.extend_from_slice(self.reader.remaining_data());
@@ -393,11 +513,6 @@ impl BackupDecryptor {
         self.reader = ByteReader::new(new_data);
     }
 
-    // process available data
-    // returns Ok if the decryption of the current frame was successful
-    // Ok(false) if there is enough data left
-    // Ok(true) if there is not enough data to decrypt the next frame -> new data should be provided using `feed_data`
-    // Ok(true) if this was the last frame
     #[wasm_bindgen]
     pub fn process_chunk(&mut self, passphrase: &str) -> Result<bool, JsValue> {
         if !self.is_initialized {
@@ -406,7 +521,6 @@ impl BackupDecryptor {
             self.keys = Some(derive_keys(passphrase, &header_data.salt)?);
             self.initialisation_vector = Some(header_data.initialisation_vector.clone());
             self.is_initialized = true;
-
             return Ok(false);
         }
 
@@ -416,7 +530,35 @@ impl BackupDecryptor {
 
         // this case happens when we had to load a new chunk because there wasn't enough data to fully decrypt the attachment
         if self.current_backup_frame.is_some() {
+            // web_sys::console::log_1(
+            //     &"going direct to payload decryption after loading new chunk".into(),
+            // );
+
             let backup_frame_cloned = self.current_backup_frame.clone().unwrap();
+
+            // let (filename, length, attachment_type) =
+            //     if let Some(attachment) = backup_frame_cloned.attachment {
+            //         (
+            //             format!("{}.bin", attachment.row_id.unwrap_or(0)),
+            //             attachment.length.unwrap_or(0),
+            //             AttachmentType::Attachment,
+            //         )
+            //     } else if let Some(sticker) = backup_frame_cloned.sticker {
+            //         (
+            //             format!("{}.bin", sticker.row_id.unwrap_or(0)),
+            //             sticker.length.unwrap_or(0),
+            //             AttachmentType::Sticker,
+            //         )
+            //     } else if let Some(avatar) = backup_frame_cloned.avatar {
+            //         (
+            //             format!("{}.bin", avatar.recipient_id.unwrap_or_default()),
+            //             avatar.length.unwrap_or(0),
+            //             AttachmentType::Avatar,
+            //         )
+            //     } else {
+            //         return Err(JsValue::from_str("Invalid field type found"));
+            //     };
+            //
 
             let length = if let Some(attachment) = backup_frame_cloned.attachment {
                 attachment.length.unwrap_or(0)
@@ -428,37 +570,51 @@ impl BackupDecryptor {
                 return Err(JsValue::from_str("Invalid field type found"));
             };
 
-            if self.reader.remaining_length() < length as usize {
-                return Ok(true);
-            } else {
-                // attachments are encoded as length, which would have to be read using decode_frame_payload
-                // +10 because in decrypt_frame_payload we would read `their_mac` from reader which is 10 bytes long
-                self.reader.increment_position((length + 10) as usize);
+            match decrypt_frame_payload(
+                &mut self.reader,
+                length as usize,
+                &keys.hmac_key,
+                &keys.cipher_key,
+                // have to use new_iv!
+                iv.as_ref(),
+                8 * 1024,
+            ) {
+                Ok(None) => {
+                    // no need to assign newly here, can stay the same as we need to load even more data
+                    return Ok(true);
+                }
+                Ok(Some(_payload)) => {
+                    self.current_backup_frame = None;
 
-                // after attachments, we have to increment again
-                self.initialisation_vector = Some(increment_initialisation_vector(iv));
-
-                self.current_backup_frame = None;
-
-                return Ok(false);
+                    // match attachment_type {
+                    //     AttachmentType::Attachment => {
+                    //         self.attachments.insert(filename, payload);
+                    //     }
+                    //     AttachmentType::Sticker => {
+                    //         self.stickers.insert(filename, payload);
+                    //     }
+                    //     AttachmentType::Avatar => {
+                    //         self.avatars.insert(filename, payload);
+                    //     }
+                    // }
+                    // after attachments, we have to increment again
+                    self.initialisation_vector = Some(increment_initialisation_vector(iv));
+                }
+                Err(e) => return Err(e),
             }
+
+            return Ok(false);
         }
 
-        // we need to do this here so that during get_frame_length and decrypt_frame we use the same hmac and ctr
         let mut hmac = <HmacSha256 as Mac>::new_from_slice(&keys.hmac_key)
             .map_err(|_| JsValue::from_str("Invalid HMAC key"))?;
 
         let mut ctr = <Ctr32BE<Aes256> as KeyIvInit>::new_from_slices(&keys.cipher_key, iv)
             .map_err(|_| JsValue::from_str("Invalid CTR parameters"))?;
 
-        let initial_reader_position = self.reader.get_position();
-
         let frame_length =
             match get_frame_length(&mut self.reader, &mut hmac, &mut ctr, header_data.version) {
                 Ok(None) => {
-                    // need to reset the position here because getting the length and decrypting the frame rely on
-                    // the same hmac / ctr and if we don't read the position first they won't be correct
-                    self.reader.set_position(initial_reader_position);
                     return Ok(true);
                 }
                 Ok(Some(length)) => length,
@@ -476,9 +632,12 @@ impl BackupDecryptor {
             frame_length,
         ) {
             Ok(None) => {
+                self.current_backup_frame_length = Some(frame_length);
                 return Ok(true);
             }
             Ok(Some(backup_frame)) => {
+                self.current_backup_frame_length = None;
+
                 // can not assign right here because of borrowing issues
                 let mut new_iv = increment_initialisation_vector(iv);
 
@@ -504,7 +663,7 @@ impl BackupDecryptor {
                                 let params: Vec<String> = statement
                                     .parameters
                                     .iter()
-                                    .map(|param| sql_parameter_to_string(param))
+                                    .map(|param| parameter_to_string(param))
                                     .collect::<Result<_, _>>()?;
 
                                 process_parameter_placeholders(&sql, &params)?
@@ -516,13 +675,113 @@ impl BackupDecryptor {
                             self.database_bytes
                                 .extend_from_slice(processed_sql.as_bytes());
                             self.database_bytes.push(b';');
+
+                            // Store individual statement
+                            // self.database_statements.push(processed_sql);
                         }
                     }
-                } else if backup_frame.preference.is_some() || backup_frame.key_value.is_some() {
+                } else if let Some(preference) = backup_frame.preference {
+                    let value_dict = self
+                        .preferences
+                        .entry(preference.file.unwrap_or_default())
+                        .or_default()
+                        .entry(preference.key.unwrap_or_default())
+                        .or_default();
+
+                    if let Some(value) = preference.value {
+                        value_dict.insert("value".to_string(), serde_json::Value::String(value));
+                    }
+                    if let Some(boolean_value) = preference.boolean_value {
+                        value_dict.insert(
+                            "booleanValue".to_string(),
+                            serde_json::Value::Bool(boolean_value),
+                        );
+                    }
+                    if preference.is_string_set_value.unwrap_or(false) {
+                        value_dict.insert(
+                            "stringSetValue".to_string(),
+                            serde_json::Value::Array(
+                                preference
+                                    .string_set_value
+                                    .into_iter()
+                                    .map(serde_json::Value::String)
+                                    .collect(),
+                            ),
+                        );
+                    }
+                } else if let Some(key_value) = backup_frame.key_value {
+                    let value_dict = self
+                        .key_values
+                        .entry(key_value.key.unwrap_or_default())
+                        .or_default();
+
+                    if let Some(boolean_value) = key_value.boolean_value {
+                        value_dict.insert(
+                            "booleanValue".to_string(),
+                            serde_json::Value::Bool(boolean_value),
+                        );
+                    }
+                    if let Some(float_value) = key_value.float_value {
+                        value_dict.insert(
+                            "floatValue".to_string(),
+                            serde_json::Value::Number(
+                                serde_json::Number::from_f64(float_value.into()).unwrap(),
+                            ),
+                        );
+                    }
+                    if let Some(integer_value) = key_value.integer_value {
+                        value_dict.insert(
+                            "integerValue".to_string(),
+                            serde_json::Value::Number(integer_value.into()),
+                        );
+                    }
+                    if let Some(long_value) = key_value.long_value {
+                        value_dict.insert(
+                            "longValue".to_string(),
+                            serde_json::Value::Number(long_value.into()),
+                        );
+                    }
+                    if let Some(string_value) = key_value.string_value {
+                        value_dict.insert(
+                            "stringValue".to_string(),
+                            serde_json::Value::String(string_value),
+                        );
+                    }
+                    if let Some(blob_value) = key_value.blob_value {
+                        value_dict.insert(
+                            "blobValueBase64".to_string(),
+                            serde_json::Value::String(base64::Engine::encode(
+                                &base64::engine::general_purpose::STANDARD,
+                                &blob_value,
+                            )),
+                        );
+                    }
                 } else {
-                    // we just skip these types here
                     let backup_frame_cloned = backup_frame.clone();
 
+                    // let (filename, length, attachment_type) =
+                    //     if let Some(attachment) = backup_frame_cloned.attachment {
+                    //         (
+                    //             format!("{}.bin", attachment.row_id.unwrap_or(0)),
+                    //             attachment.length.unwrap_or(0),
+                    //             AttachmentType::Attachment,
+                    //         )
+                    //     } else if let Some(sticker) = backup_frame_cloned.sticker {
+                    //         (
+                    //             format!("{}.bin", sticker.row_id.unwrap_or(0)),
+                    //             sticker.length.unwrap_or(0),
+                    //             AttachmentType::Sticker,
+                    //         )
+                    //     } else if let Some(avatar) = backup_frame_cloned.avatar {
+                    //         (
+                    //             format!("{}.bin", avatar.recipient_id.unwrap_or_default()),
+                    //             avatar.length.unwrap_or(0),
+                    //             AttachmentType::Avatar,
+                    //         )
+                    //     } else {
+                    //         return Err(JsValue::from_str("Invalid field type found"));
+                    //     };
+                    //
                     let length = if let Some(attachment) = backup_frame_cloned.attachment {
                         attachment.length.unwrap_or(0)
                     } else if let Some(sticker) = backup_frame_cloned.sticker {
@@ -533,20 +792,40 @@ impl BackupDecryptor {
                         return Err(JsValue::from_str("Invalid field type found"));
                     };
 
-                    if self.reader.remaining_length() < length as usize {
-                        // important: we need to apply the first new_iv here, else it won't be correct when resuming payload decryption
-                        // as we return, we don't get to the final assignment below
-                        self.initialisation_vector = Some(new_iv);
+                    match decrypt_frame_payload(
+                        &mut self.reader,
+                        length as usize,
+                        &keys.hmac_key,
+                        &keys.cipher_key,
+                        // have to use new_iv!
+                        new_iv.as_ref(),
+                        8 * 1024,
+                    ) {
+                        Ok(None) => {
+                            // important: we need to apply the first new_iv here, else it won't be correct when resuming payload decryption
+                            // as we return, we don't get to the final assignment below
+                            self.initialisation_vector = Some(new_iv);
 
-                        self.current_backup_frame = Some(backup_frame.clone());
+                            self.current_backup_frame = Some(backup_frame.clone());
 
-                        return Ok(true);
-                    } else {
-                        // attachments are encoded as length, which would have to be read using decode_frame_payload
-                        // +10 because in decrypt_frame_payload we would read `their_mac` from reader which is 10 bytes long
-                        self.reader.increment_position((length + 10) as usize);
-
-                        new_iv = increment_initialisation_vector(&new_iv);
+                            return Ok(true);
+                        }
+                        Ok(Some(_payload)) => {
+                            // match attachment_type {
+                            //     AttachmentType::Attachment => {
+                            //         self.attachments.insert(filename, payload);
+                            //     }
+                            //     AttachmentType::Sticker => {
+                            //         self.stickers.insert(filename, payload);
+                            //     }
+                            //     AttachmentType::Avatar => {
+                            //         self.avatars.insert(filename, payload);
+                            //     }
+                            // }
+                            // after attachments, we have to increment again
+                            new_iv = increment_initialisation_vector(&new_iv);
+                        }
+                        Err(e) => return Err(e),
                     }
                 }
 
@@ -570,6 +849,12 @@ impl BackupDecryptor {
     pub fn finish(self) -> Result<DecryptionResult, JsValue> {
         Ok(DecryptionResult {
             database_bytes: self.database_bytes,
+            preferences: serde_json::to_string(&self.preferences).map_err(|e| {
+                JsValue::from_str(&format!("Failed to serialize preferences: {}", e))
+            })?,
+            key_values: serde_json::to_string(&self.key_values).map_err(|e| {
+                JsValue::from_str(&format!("Failed to serialize key_values: {}", e))
+            })?,
         })
     }
 }
