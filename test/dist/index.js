@@ -29,7 +29,7 @@ export async function decryptBackup(file, passphrase, progressCallback) {
         console.info(`${percent}% done`);
       }
 
-      console.log(`Processing chunk at offset ${offset}`);
+      // console.log(`Processing chunk at offset ${offset}`);
       const chunk = file.slice(offset, offset + chunkSize);
       const arrayBuffer = await chunk.arrayBuffer();
       const uint8Array = new Uint8Array(arrayBuffer);
@@ -47,19 +47,18 @@ export async function decryptBackup(file, passphrase, progressCallback) {
       }
 
       offset += chunkSize;
-      console.log(`Completed chunk, new offset: ${offset}`);
-      if (performance.memory) {
-        const memoryInfo = performance.memory;
-        console.log(`Total JS Heap Size: ${memoryInfo.totalJSHeapSize} bytes`);
-        console.log(`Used JS Heap Size: ${memoryInfo.usedJSHeapSize} bytes`);
-        console.log(`JS Heap Size Limit: ${memoryInfo.jsHeapSizeLimit} bytes`);
-      } else {
-        console.log("Memory information is not available in this environment.");
-      }
+      // console.log(`Completed chunk, new offset: ${offset}`);
+      // if (performance.memory) {
+      //   const memoryInfo = performance.memory;
+      //   console.log(`Total JS Heap Size: ${memoryInfo.totalJSHeapSize} bytes`);
+      //   console.log(`Used JS Heap Size: ${memoryInfo.usedJSHeapSize} bytes`);
+      //   console.log(`JS Heap Size Limit: ${memoryInfo.jsHeapSizeLimit} bytes`);
+      // } else {
+      //   console.log("Memory information is not available in this environment.");
+      // }
     }
 
-    console.log("All chunks processed, finishing up");
-    console.log(window.performance.measureUserAgentSpecificMemory());
+    // console.log("All chunks processed, finishing up");
     return decryptor.finish();
   } catch (e) {
     console.error("Decryption failed:", e);
@@ -71,13 +70,15 @@ async function decrypt(file, passphrase) {
   try {
     const result = await decryptBackup(file, passphrase);
 
-    console.log("Database bytes length:", result.databaseBytes.length);
-    console.log("Preferences:", result.preferences);
-    console.log("Key values:", result.keyValues);
+    console.log(result, result.database_bytes);
 
-    // Example: Convert database bytes to SQL statements
-    const sqlStatements = new TextDecoder().decode(result.databaseBytes);
-    console.log("SQL statements:", sqlStatements);
+    // console.log("Database bytes length:", result.databaseBytes.length);
+    console.log(
+      "Database bytes as string (partly)",
+      new TextDecoder().decode(result.database_bytes.slice(0, 1024 * 50)),
+    );
+    // console.log("Preferences:", result.preferences);
+    // console.log("Key values:", result.keyValues);
   } catch (error) {
     console.error("Decryption failed:", error);
   }

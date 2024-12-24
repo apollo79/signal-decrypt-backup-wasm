@@ -39,12 +39,12 @@ pub mod signal {
     include!(concat!(env!("OUT_DIR"), "/signal.rs"));
 }
 
-#[derive(Debug)]
-enum AttachmentType {
-    Attachment,
-    Sticker,
-    Avatar,
-}
+// #[derive(Debug)]
+// enum AttachmentType {
+//     Attachment,
+//     Sticker,
+//     Avatar,
+// }
 
 #[wasm_bindgen]
 pub struct DecryptionResult {
@@ -90,14 +90,6 @@ impl ByteReader {
         self.remaining_data().len()
     }
 
-    fn get_position(&self) -> usize {
-        self.position
-    }
-
-    fn set_position(&mut self, position: usize) {
-        self.position = position;
-    }
-
     fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
         let available = self.remaining_data();
 
@@ -137,6 +129,74 @@ struct HeaderData {
 struct Keys {
     cipher_key: Vec<u8>,
     hmac_key: Vec<u8>,
+}
+
+fn parameter_to_string(parameter: &signal::sql_statement::SqlParameter) -> Result<String, JsValue> {
+    if let Some(s) = &parameter.string_paramter {
+        Ok(format!("'{}'", s.replace("'", "''")))
+    } else if let Some(i) = parameter.integer_parameter {
+        let signed_i = if i & (1 << 63) != 0 {
+            i | (-1_i64 << 63) as u64
+        } else {
+            i
+        };
+        Ok(signed_i.to_string())
+    } else if let Some(d) = parameter.double_parameter {
+        Ok(d.to_string())
+    } else if let Some(b) = &parameter.blob_parameter {
+        Ok(format!("X'{}'", hex::encode(b)))
+    } else if parameter.nullparameter.is_some() {
+        Ok("NULL".to_string())
+    } else {
+        Ok("NULL".to_string())
+    }
+}
+
+fn process_parameter_placeholders(sql: &str, params: &[String]) -> Result<String, JsValue> {
+    let mut result = sql.to_string();
+    let mut param_index = 0;
+
+    // Handle different types of parameter placeholders
+    while param_index < params.len() {
+        let rest = &result[param_index..];
+
+        // Find the next placeholder
+        let next_placeholder = rest.find('?').map(|i| (i, 1)); // ? style
+
+        match next_placeholder {
+            Some((pos, len)) => {
+                // Replace the placeholder with the parameter value
+                if param_index < params.len() {
+                    let before = &result[..param_index + pos];
+                    let after = &result[param_index + pos + len..];
+                    result = format!("{}{}{}", before, params[param_index], after);
+                    param_index += 1;
+                } else {
+                    return Err(JsValue::from_str(
+                        "Not enough parameters provided for SQL statement",
+                    ));
+                }
+            }
+            None => {
+                // No more placeholders found
+                break;
+            }
+        }
+    }
+
+    // Check if we have unused parameters
+    if param_index < params.len() {
+        web_sys::console::warn_1(
+            &format!(
+                "Warning: {} parameters were provided but not all were used in SQL: {}",
+                params.len(),
+                sql
+            )
+            .into(),
+        );
+    }
+
+    Ok(result)
 }
 
 fn derive_keys(passphrase: &str, salt: &[u8]) -> Result<Keys, JsValue> {
@@ -203,30 +263,17 @@ fn io_err_to_js(e: io::Error) -> JsValue {
     JsValue::from_str(&format!("IO Error: {}", e))
 }
 
-fn decrypt_frame(
+fn get_frame_length(
     reader: &mut ByteReader,
-    hmac_key: &[u8],
-    cipher_key: &[u8],
-    initialisation_vector: &[u8],
+    hmac: &mut HmacSha256,
+    ctr: &mut Ctr32BE<Aes256>,
     header_version: Option<u32>,
-    ciphertext_buf: &mut Vec<u8>,
-    plaintext_buf: &mut Vec<u8>,
-    should_update_hmac: bool,
-) -> Result<Option<signal::BackupFrame>, JsValue> {
+) -> Result<Option<u32>, JsValue> {
     if reader.remaining_length() < 4 {
         web_sys::console::log_1(&"too less data to decrypt frame length".into());
 
         return Ok(None); // Not enough data to read the frame length
     }
-
-    let initial_position = reader.get_position();
-
-    let mut hmac = <HmacSha256 as Mac>::new_from_slice(hmac_key)
-        .map_err(|_| JsValue::from_str("Invalid HMAC key"))?;
-
-    let mut ctr =
-        <Ctr32BE<Aes256> as KeyIvInit>::new_from_slices(cipher_key, initialisation_vector)
-            .map_err(|_| JsValue::from_str("Invalid CTR parameters"))?;
 
     let length = match header_version {
         None => {
@@ -245,11 +292,9 @@ fn decrypt_frame(
             //     &format!("encrypted length bytes: {:02x?}", encrypted_length).into(),
             // );
 
-            if should_update_hmac == true {
-                // web_sys::console::log_1(&"updating hmac".into());
+            // web_sys::console::log_1(&"updating hmac".into());
 
-                Mac::update(&mut hmac, &encrypted_length);
-            }
+            Mac::update(hmac, &encrypted_length);
 
             let mut decrypted_length = encrypted_length;
             ctr.apply_keystream(&mut decrypted_length);
@@ -265,11 +310,20 @@ fn decrypt_frame(
         Some(v) => return Err(JsValue::from_str(&format!("Unsupported version: {}", v))),
     };
 
+    Ok(Some(length))
+}
+
+fn decrypt_frame(
+    reader: &mut ByteReader,
+    mut hmac: HmacSha256,
+    ctr: &mut Ctr32BE<Aes256>,
+    ciphertext_buf: &mut Vec<u8>,
+    plaintext_buf: &mut Vec<u8>,
+    length: u32,
+) -> Result<Option<signal::BackupFrame>, JsValue> {
     if reader.remaining_length() < length as usize {
         // web_sys::console::log_1(&"remaining data is too less".into());
 
-        // reset the buffer for the next iteration
-        reader.set_position(initial_position);
         return Ok(None); // Not =enough data to read the frame
     }
 
@@ -392,14 +446,14 @@ pub struct BackupDecryptor {
     database_bytes: Vec<u8>,
     preferences: HashMap<String, HashMap<String, HashMap<String, serde_json::Value>>>,
     key_values: HashMap<String, HashMap<String, serde_json::Value>>,
-    attachments: HashMap<String, Vec<u8>>,
-    stickers: HashMap<String, Vec<u8>>,
-    avatars: HashMap<String, Vec<u8>>,
+    // attachments: HashMap<String, Vec<u8>>,
+    // stickers: HashMap<String, Vec<u8>>,
+    // avatars: HashMap<String, Vec<u8>>,
     ciphertext_buf: Vec<u8>,
     plaintext_buf: Vec<u8>,
     total_bytes_received: usize,
     is_initialized: bool,
-    should_update_hmac_next_run: bool,
+    current_backup_frame_length: Option<u32>,
     current_backup_frame: Option<signal::BackupFrame>,
 }
 
@@ -416,14 +470,14 @@ impl BackupDecryptor {
             database_bytes: Vec::new(),
             preferences: HashMap::new(),
             key_values: HashMap::new(),
-            attachments: HashMap::new(),
-            stickers: HashMap::new(),
-            avatars: HashMap::new(),
+            // attachments: HashMap::new(),
+            // stickers: HashMap::new(),
+            // avatars: HashMap::new(),
             ciphertext_buf: Vec::new(),
             plaintext_buf: Vec::new(),
             total_bytes_received: 0,
             is_initialized: false,
-            should_update_hmac_next_run: true,
+            current_backup_frame_length: None,
             current_backup_frame: None,
         }
     }
@@ -475,28 +529,39 @@ impl BackupDecryptor {
 
             let backup_frame_cloned = self.current_backup_frame.clone().unwrap();
 
-            let (filename, length, attachment_type) =
-                if let Some(attachment) = backup_frame_cloned.attachment {
-                    (
-                        format!("{}.bin", attachment.row_id.unwrap_or(0)),
-                        attachment.length.unwrap_or(0),
-                        AttachmentType::Attachment,
-                    )
-                } else if let Some(sticker) = backup_frame_cloned.sticker {
-                    (
-                        format!("{}.bin", sticker.row_id.unwrap_or(0)),
-                        sticker.length.unwrap_or(0),
-                        AttachmentType::Sticker,
-                    )
-                } else if let Some(avatar) = backup_frame_cloned.avatar {
-                    (
-                        format!("{}.bin", avatar.recipient_id.unwrap_or_default()),
-                        avatar.length.unwrap_or(0),
-                        AttachmentType::Avatar,
-                    )
-                } else {
-                    return Err(JsValue::from_str("Invalid field type found"));
-                };
+            // let (filename, length, attachment_type) =
+            //     if let Some(attachment) = backup_frame_cloned.attachment {
+            //         (
+            //             format!("{}.bin", attachment.row_id.unwrap_or(0)),
+            //             attachment.length.unwrap_or(0),
+            //             AttachmentType::Attachment,
+            //         )
+            //     } else if let Some(sticker) = backup_frame_cloned.sticker {
+            //         (
+            //             format!("{}.bin", sticker.row_id.unwrap_or(0)),
+            //             sticker.length.unwrap_or(0),
+            //             AttachmentType::Sticker,
+            //         )
+            //     } else if let Some(avatar) = backup_frame_cloned.avatar {
+            //         (
+            //             format!("{}.bin", avatar.recipient_id.unwrap_or_default()),
+            //             avatar.length.unwrap_or(0),
+            //             AttachmentType::Avatar,
+            //         )
+            //     } else {
+            //         return Err(JsValue::from_str("Invalid field type found"));
+            //     };
+            //
+
+            let length = if let Some(attachment) = backup_frame_cloned.attachment {
+                attachment.length.unwrap_or(0)
+            } else if let Some(sticker) = backup_frame_cloned.sticker {
+                sticker.length.unwrap_or(0)
+            } else if let Some(avatar) = backup_frame_cloned.avatar {
+                avatar.length.unwrap_or(0)
+            } else {
+                return Err(JsValue::from_str("Invalid field type found"));
+            };
 
             match decrypt_frame_payload(
                 &mut self.reader,
@@ -511,7 +576,7 @@ impl BackupDecryptor {
                     // no need to assign newly here, can stay the same as we need to load even more data
                     return Ok(true);
                 }
-                Ok(Some(payload)) => {
+                Ok(Some(_payload)) => {
                     self.current_backup_frame = None;
 
                     // match attachment_type {
@@ -534,24 +599,37 @@ impl BackupDecryptor {
             return Ok(false);
         }
 
+        let mut hmac = <HmacSha256 as Mac>::new_from_slice(&keys.hmac_key)
+            .map_err(|_| JsValue::from_str("Invalid HMAC key"))?;
+
+        let mut ctr = <Ctr32BE<Aes256> as KeyIvInit>::new_from_slices(&keys.cipher_key, iv)
+            .map_err(|_| JsValue::from_str("Invalid CTR parameters"))?;
+
+        let frame_length =
+            match get_frame_length(&mut self.reader, &mut hmac, &mut ctr, header_data.version) {
+                Ok(None) => {
+                    return Ok(true);
+                }
+                Ok(Some(length)) => length,
+                Err(e) => return Err(e),
+            };
+
         // if we got to an attachment, but there we demand more data, it will be faulty, because we try to decrypt the frame although we would need
         // to decrypt the attachment
         match decrypt_frame(
             &mut self.reader,
-            &keys.hmac_key,
-            &keys.cipher_key,
-            iv,
-            header_data.version,
+            hmac,
+            &mut ctr,
             &mut self.ciphertext_buf,
             &mut self.plaintext_buf,
-            self.should_update_hmac_next_run,
+            frame_length,
         ) {
             Ok(None) => {
-                self.should_update_hmac_next_run = false;
+                self.current_backup_frame_length = Some(frame_length);
                 return Ok(true);
             }
             Ok(Some(backup_frame)) => {
-                self.should_update_hmac_next_run = true;
+                self.current_backup_frame_length = None;
 
                 // can not assign right here because of borrowing issues
                 let mut new_iv = increment_initialisation_vector(iv);
@@ -574,8 +652,25 @@ impl BackupDecryptor {
                             && !sql.contains("sms_fts_")
                             && !sql.contains("mms_fts_")
                         {
-                            self.database_bytes.extend_from_slice(sql.as_bytes());
+                            let processed_sql = if !statement.parameters.is_empty() {
+                                let params: Vec<String> = statement
+                                    .parameters
+                                    .iter()
+                                    .map(|param| parameter_to_string(param))
+                                    .collect::<Result<_, _>>()?;
+
+                                process_parameter_placeholders(&sql, &params)?
+                            } else {
+                                sql
+                            };
+
+                            // Add to concatenated string
+                            self.database_bytes
+                                .extend_from_slice(processed_sql.as_bytes());
                             self.database_bytes.push(b';');
+
+                            // Store individual statement
+                            // self.database_statements.push(processed_sql);
                         }
                     }
                 } else if let Some(preference) = backup_frame.preference {
@@ -657,28 +752,38 @@ impl BackupDecryptor {
                 } else {
                     let backup_frame_cloned = backup_frame.clone();
 
-                    let (filename, length, attachment_type) =
-                        if let Some(attachment) = backup_frame_cloned.attachment {
-                            (
-                                format!("{}.bin", attachment.row_id.unwrap_or(0)),
-                                attachment.length.unwrap_or(0),
-                                AttachmentType::Attachment,
-                            )
-                        } else if let Some(sticker) = backup_frame_cloned.sticker {
-                            (
-                                format!("{}.bin", sticker.row_id.unwrap_or(0)),
-                                sticker.length.unwrap_or(0),
-                                AttachmentType::Sticker,
-                            )
-                        } else if let Some(avatar) = backup_frame_cloned.avatar {
-                            (
-                                format!("{}.bin", avatar.recipient_id.unwrap_or_default()),
-                                avatar.length.unwrap_or(0),
-                                AttachmentType::Avatar,
-                            )
-                        } else {
-                            return Err(JsValue::from_str("Invalid field type found"));
-                        };
+                    // let (filename, length, attachment_type) =
+                    //     if let Some(attachment) = backup_frame_cloned.attachment {
+                    //         (
+                    //             format!("{}.bin", attachment.row_id.unwrap_or(0)),
+                    //             attachment.length.unwrap_or(0),
+                    //             AttachmentType::Attachment,
+                    //         )
+                    //     } else if let Some(sticker) = backup_frame_cloned.sticker {
+                    //         (
+                    //             format!("{}.bin", sticker.row_id.unwrap_or(0)),
+                    //             sticker.length.unwrap_or(0),
+                    //             AttachmentType::Sticker,
+                    //         )
+                    //     } else if let Some(avatar) = backup_frame_cloned.avatar {
+                    //         (
+                    //             format!("{}.bin", avatar.recipient_id.unwrap_or_default()),
+                    //             avatar.length.unwrap_or(0),
+                    //             AttachmentType::Avatar,
+                    //         )
+                    //     } else {
+                    //         return Err(JsValue::from_str("Invalid field type found"));
+                    //     };
+                    //
+                    let length = if let Some(attachment) = backup_frame_cloned.attachment {
+                        attachment.length.unwrap_or(0)
+                    } else if let Some(sticker) = backup_frame_cloned.sticker {
+                        sticker.length.unwrap_or(0)
+                    } else if let Some(avatar) = backup_frame_cloned.avatar {
+                        avatar.length.unwrap_or(0)
+                    } else {
+                        return Err(JsValue::from_str("Invalid field type found"));
+                    };
 
                     match decrypt_frame_payload(
                         &mut self.reader,
@@ -698,7 +803,7 @@ impl BackupDecryptor {
 
                             return Ok(true);
                         }
-                        Ok(Some(payload)) => {
+                        Ok(Some(_payload)) => {
                             // match attachment_type {
                             //     AttachmentType::Attachment => {
                             //         self.attachments.insert(filename, payload);
