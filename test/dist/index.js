@@ -14,21 +14,17 @@ async function initialize() {
 export async function decryptBackup(file, passphrase, progressCallback) {
   await initialize();
 
-  console.log("Starting decryption of file size:", file.size);
+  const fileSize = file.size;
+  console.log("Starting decryption of file size:", fileSize);
   const decryptor = new BackupDecryptor();
+  decryptor.set_progress_callback(fileSize, (percentage) =>
+    console.info(`${percentage}% done`),
+  );
   const chunkSize = 1024 * 1024 * 40; // 40MB chunks
   let offset = 0;
-  let percent;
 
   try {
     while (offset < file.size) {
-      const newPercent = Math.round((100 / file.size) * offset);
-
-      if (newPercent !== percent) {
-        percent = newPercent;
-        console.info(`${percent}% done`);
-      }
-
       // console.log(`Processing chunk at offset ${offset}`);
       const chunk = file.slice(offset, offset + chunkSize);
       const arrayBuffer = await chunk.arrayBuffer();
@@ -59,7 +55,11 @@ export async function decryptBackup(file, passphrase, progressCallback) {
     }
 
     // console.log("All chunks processed, finishing up");
-    return decryptor.finish();
+    const result = decryptor.finish();
+
+    decryptor.free();
+
+    return result;
   } catch (e) {
     console.error("Decryption failed:", e);
     throw e;
