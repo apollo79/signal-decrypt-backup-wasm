@@ -560,16 +560,7 @@ impl BackupDecryptor {
                                         .map(|param| sql_parameter_to_string(param))
                                         .collect::<Result<_, _>>()?;
 
-                                    let sql_string = process_parameter_placeholders(&sql, &params)?;
-
-                                    if sql_string.contains("?") {
-                                        return Err(JsValue::from_str(&format!(
-                                            "found unreplaced placeholder: sql: {}\n final sql string: {}\n params: {:?}",
-                                            sql, sql_string, params
-                                        )));
-                                    }
-
-                                    sql_string
+                                    process_parameter_placeholders(&sql, &params)?
                                 } else {
                                     sql
                                 };
