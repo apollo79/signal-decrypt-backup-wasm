@@ -158,27 +158,33 @@ fn sql_parameter_to_string(
 fn process_parameter_placeholders(sql: &str, params: &[String]) -> Result<String, JsValue> {
     let mut result = sql.to_string();
     let mut param_index = 0;
+    let mut str_index = 0;
 
-    while param_index < params.len() {
-        let rest = &result[param_index..];
-
-        // Find the next placeholders
-        // signal backups only use the standard type and not indexed or other ones
-        let next_placeholder = rest.find('?').map(|i| (i, 1)); // ? style
+    while str_index < result.len() {
+        // Find the next placeholder
+        let next_placeholder = result[str_index..].find('?');
 
         match next_placeholder {
-            Some((pos, len)) => {
-                // Replace the placeholder with the parameter value
-                if param_index < params.len() {
-                    let before = &result[..param_index + pos];
-                    let after = &result[param_index + pos + len..];
-                    result = format!("{}{}{}", before, params[param_index], after);
-                    param_index += 1;
-                } else {
+            Some(pos) => {
+                // Calculate the actual position in the result string
+                let actual_pos = str_index + pos;
+
+                // Check if we have enough parameters
+                if param_index >= params.len() {
                     return Err(JsValue::from_str(
                         "Not enough parameters provided for SQL statement",
                     ));
                 }
+
+                // Replace the placeholder with the parameter value
+                let before = &result[..actual_pos];
+                let after = &result[actual_pos + 1..]; // Skip the placeholder '?'
+
+                // Update str_index to the new position after the replacement
+                str_index = before.len() + params[param_index].len();
+
+                result = format!("{}{}{}", before, params[param_index], after);
+                param_index += 1;
             }
             None => {
                 // No more placeholders found
@@ -554,7 +560,16 @@ impl BackupDecryptor {
                                         .map(|param| sql_parameter_to_string(param))
                                         .collect::<Result<_, _>>()?;
 
-                                    process_parameter_placeholders(&sql, &params)?
+                                    let sql_string = process_parameter_placeholders(&sql, &params)?;
+
+                                    if sql_string.contains("?") {
+                                        return Err(JsValue::from_str(&format!(
+                                            "found unreplaced placeholder: sql: {}\n final sql string: {}\n params: {:?}",
+                                            sql, sql_string, params
+                                        )));
+                                    }
+
+                                    sql_string
                                 } else {
                                     sql
                                 };
