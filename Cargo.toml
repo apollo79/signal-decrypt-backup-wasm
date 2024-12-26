@@ -5,7 +5,6 @@ edition = "2021"
 description = "Get the raw database from your Signal backup. Written for webassembly"
 repository = "https://git.duskflower.dev/duskflower/signal-decrypt-backup-wasm"
 license = "GPL-3-only"
-license-file = "LICENSE"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

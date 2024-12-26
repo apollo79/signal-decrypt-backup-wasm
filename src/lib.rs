@@ -41,14 +41,14 @@ type HmacSha256 = Hmac<Sha256>;
 
 #[wasm_bindgen]
 pub struct DecryptionResult {
-    database_bytes: Vec<u8>,
+    database_statements: Vec<String>,
 }
 
 #[wasm_bindgen]
 impl DecryptionResult {
     #[wasm_bindgen(getter)]
-    pub fn database_bytes(&self) -> Vec<u8> {
-        self.database_bytes.clone()
+    pub fn database_statements(&self) -> Vec<String> {
+        self.database_statements.clone()
     }
 }
 
@@ -355,7 +355,7 @@ pub struct BackupDecryptor {
     keys: Option<Keys>,
     header_data: Option<HeaderData>,
     initialisation_vector: Option<Vec<u8>>,
-    database_bytes: Vec<u8>,
+    database_statements: Vec<String>,
     ciphertext_buf: Vec<u8>,
     plaintext_buf: Vec<u8>,
     total_file_size: usize,
@@ -379,7 +379,7 @@ impl BackupDecryptor {
             keys: None,
             header_data: None,
             initialisation_vector: None,
-            database_bytes: Vec::new(),
+            database_statements: Vec::new(),
             ciphertext_buf: Vec::new(),
             plaintext_buf: Vec::new(),
             total_file_size: 0,
@@ -544,8 +544,7 @@ impl BackupDecryptor {
                     if let Some(version) = backup_frame.version {
                         if let Some(ver_num) = version.version {
                             let pragma_sql = format!("PRAGMA user_version = {}", ver_num);
-                            self.database_bytes.extend_from_slice(pragma_sql.as_bytes());
-                            self.database_bytes.push(b';');
+                            self.database_statements.push(pragma_sql);
                         }
                     } else if let Some(statement) = backup_frame.statement {
                         if let Some(sql) = statement.statement {
@@ -562,13 +561,10 @@ impl BackupDecryptor {
 
                                     process_parameter_placeholders(&sql, &params)?
                                 } else {
-                                    sql
+                                    sql.clone()
                                 };
 
-                                // Add to concatenated string
-                                self.database_bytes
-                                    .extend_from_slice(processed_sql.as_bytes());
-                                self.database_bytes.push(b';');
+                                self.database_statements.push(processed_sql);
                             }
                         }
                     } else if backup_frame.preference.is_some() || backup_frame.key_value.is_some()
@@ -628,7 +624,7 @@ impl BackupDecryptor {
     #[wasm_bindgen]
     pub fn finish(self) -> Result<DecryptionResult, JsValue> {
         Ok(DecryptionResult {
-            database_bytes: self.database_bytes,
+            database_statements: self.database_statements,
         })
     }
 }
